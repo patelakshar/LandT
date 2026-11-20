@@ -7,6 +7,13 @@ using PdfSolverMvc.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(options =>
+{
+    options.SingleLine = true;
+    options.TimestampFormat = "HH:mm:ss ";
+});
+
 builder.Services.AddControllersWithViews();
 
 // Allow large PDF uploads (up to 100 MB)

@@ -110,6 +110,9 @@ public class OcrService : IOcrService
 
             try
             {
+                _logger.LogInformation("[PDF] 3b. OCR: Page {Page}: Running PDFtoImage ({Dpi} DPI) + SkiaSharp preprocessing + Tesseract ({Lang})...",
+                    zeroBasedPageIndex + 1, _dpi, effectiveLang);
+
                 // First pass at configured DPI
                 var firstPass = RunOcrAtDpi(pdfFilePath, zeroBasedPageIndex, effectiveLang, _dpi, cancellationToken);
 
@@ -117,10 +120,14 @@ public class OcrService : IOcrService
                 if (_fallbackDpi > _dpi &&
                     (!firstPass.Success || (firstPass.Confidence ?? 0f) < _minAcceptableConfidence || firstPass.Text.Length < 25))
                 {
+                    _logger.LogInformation("[PDF] 3b. OCR: Page {Page}: Low OCR confidence ({Conf:P0}), retrying at {FallbackDpi} DPI...",
+                        zeroBasedPageIndex + 1, firstPass.Confidence ?? 0f, _fallbackDpi);
                     var secondPass = RunOcrAtDpi(pdfFilePath, zeroBasedPageIndex, effectiveLang, _fallbackDpi, cancellationToken);
                     if (IsBetterResult(secondPass, firstPass))
                     {
                         var note = $"Used fallback {_fallbackDpi} DPI (confidence {(secondPass.Confidence ?? 0f):P0}).";
+                        _logger.LogInformation("[PDF] 3b. OCR: Page {Page}: Tesseract OCR finished | Confidence={Conf:P0} | PSM={Psm} | Rotation={Rot:0}°",
+                            zeroBasedPageIndex + 1, secondPass.Confidence ?? 0f, secondPass.SelectedPsm, secondPass.AppliedRotationDegrees ?? 0);
                         return secondPass with
                         {
                             Message = string.IsNullOrWhiteSpace(secondPass.Message) ? note : $"{secondPass.Message} | {note}",
@@ -129,6 +136,8 @@ public class OcrService : IOcrService
                     }
                 }
 
+                _logger.LogInformation("[PDF] 3b. OCR: Page {Page}: Tesseract OCR finished | Confidence={Conf:P0} | PSM={Psm} | Rotation={Rot:0}°",
+                    zeroBasedPageIndex + 1, firstPass.Confidence ?? 0f, firstPass.SelectedPsm, firstPass.AppliedRotationDegrees ?? 0);
                 return firstPass;
             }
             catch (Exception ex)

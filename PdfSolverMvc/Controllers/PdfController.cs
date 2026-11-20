@@ -86,6 +86,9 @@ public class PdfController : Controller
                 await file.CopyToAsync(stream, cancellationToken);
             }
 
+            _logger.LogInformation("[PDF] 1. Upload: Saved '{File}' ({SizeKb:F1} KB) -> UploadedPdfs/{Stored}",
+                Path.GetFileName(file.FileName), file.Length / 1024.0, storedFileName);
+
             var imageFolder = GetImageFolderForStoredFile(storedFileName);
             var extraction = await _extractionService.ExtractAsync(fullPath, imageFolder, cancellationToken);
 
@@ -106,6 +109,9 @@ public class PdfController : Controller
             _db.PdfDocuments.Add(record);
             await _db.SaveChangesAsync(cancellationToken);
             createdIds.Add(record.Id);
+
+            _logger.LogInformation("[PDF] 4. Save: Stored Id={Id} in SQLite (pdfsolver.db -> PdfDocuments, {JsonKb:F1} KB JSON)",
+                record.Id, (record.PageTextsJson?.Length ?? 0) / 1024.0);
         }
 
         if (createdIds.Count == 0)
@@ -328,6 +334,35 @@ public class PdfController : Controller
             TempData["Success"] = $"Deleted '{doc.OriginalFileName}'.";
         }
 
+        return RedirectToAction(nameof(Index));
+    }
+
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> DeleteAll(CancellationToken cancellationToken)
+    {
+        var allDocs = await _db.PdfDocuments.ToListAsync(cancellationToken);
+        if (allDocs.Count > 0)
+        {
+            _db.PdfDocuments.RemoveRange(allDocs);
+            await _db.SaveChangesAsync(cancellationToken);
+        }
+
+        var uploadFolder = GetUploadFolder();
+        if (Directory.Exists(uploadFolder))
+        {
+            foreach (var file in Directory.GetFiles(uploadFolder))
+            {
+                System.IO.File.Delete(file);
+            }
+            var imagesDir = Path.Combine(uploadFolder, "ExtractedImages");
+            if (Directory.Exists(imagesDir))
+            {
+                Directory.Delete(imagesDir, recursive: true);
+            }
+        }
+
+        TempData["Success"] = "Cleared all uploaded PDFs and extracted data.";
         return RedirectToAction(nameof(Index));
     }
 

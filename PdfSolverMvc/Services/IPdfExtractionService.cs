@@ -8,7 +8,10 @@ public record PdfExtractionResult(
     List<PdfPageContent> Pages,
     string ExtractionMethod,
     string Status,
-    string? Notes);
+    string? Notes)
+{
+    public string RawExtractedText => RawText;
+}
 
 public interface IPdfExtractionService
 {

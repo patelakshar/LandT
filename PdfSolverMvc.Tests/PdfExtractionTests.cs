@@ -92,13 +92,11 @@ public class PdfExtractionTests : IDisposable
         var font = builder.AddStandard14Font(Standard14Font.Helvetica);
         var page = builder.AddPage(PageSize.A4);
 
-        // Header row: Item | DN15 | DN20 | DN25
         page.AddText("Item", 10, new PdfPoint(50, 750), font);
         page.AddText("DN15", 10, new PdfPoint(200, 750), font);
         page.AddText("DN20", 10, new PdfPoint(280, 750), font);
         page.AddText("DN25", 10, new PdfPoint(360, 750), font);
 
-        // Sparse row: Valve | (blank DN15) | (blank DN20) | 0651 under DN25
         page.AddText("Valve", 10, new PdfPoint(50, 720), font);
         page.AddText("0651", 10, new PdfPoint(360, 720), font);
 
@@ -128,7 +126,6 @@ public class PdfExtractionTests : IDisposable
         var p1 = builder.AddPage(PageSize.A4);
         p1.AddText("Searchable Engineering Specification Header", 12, new PdfPoint(50, 750), font);
 
-        // Page 2 has no selectable text (simulating scanned image page)
         builder.AddPage(PageSize.A4);
 
         File.WriteAllBytes(pdfPath, builder.Build());
@@ -192,7 +189,7 @@ public class PdfExtractionTests : IDisposable
             ["Ocr:TessDataPath"] = tessDir,
             ["Ocr:Language"] = "eng",
             ["Ocr:AdditionalLanguages:0"] = "deu",
-            ["Ocr:AdditionalLanguages:1"] = "fra" // missing traineddata should be skipped safely
+            ["Ocr:AdditionalLanguages:1"] = "fra"
         });
 
         var ocr = new OcrService(config, new StubWebHostEnvironment(_tempDir), NullLogger<OcrService>.Instance);
@@ -201,5 +198,86 @@ public class PdfExtractionTests : IDisposable
         Assert.Equal(new[] { "eng", "deu" }, langs);
         Assert.True(ocr.IsAvailable(out var msg));
         Assert.Null(msg);
+    }
+
+    [Fact]
+    public async Task MultiLineNumberedRows_MergeContinuationLinesIntoSingleRow()
+    {
+        var pdfPath = Path.Combine(_tempDir, "multiline_pms.pdf");
+        var builder = new PdfDocumentBuilder();
+        var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+        var page = builder.AddPage(PageSize.A4);
+
+        page.AddText("Sr", 9, new PdfPoint(30, 760), font);
+        page.AddText("Class", 9, new PdfPoint(80, 760), font);
+        page.AddText("Service", 9, new PdfPoint(160, 760), font);
+        page.AddText("Rating", 9, new PdfPoint(320, 760), font);
+
+        // Row 94 with wrapped Service line
+        page.AddText("94", 9, new PdfPoint(30, 730), font);
+        page.AddText("17320NX", 9, new PdfPoint(80, 730), font);
+        page.AddText("COOLING WATER", 9, new PdfPoint(160, 730), font);
+        page.AddText("150", 9, new PdfPoint(320, 730), font);
+        page.AddText("WASH DOWN", 9, new PdfPoint(160, 718), font);
+
+        // Rows 95-97 so numbered table heuristic activates
+        page.AddText("95", 9, new PdfPoint(30, 695), font);
+        page.AddText("31008N", 9, new PdfPoint(80, 695), font);
+        page.AddText("PROCESS", 9, new PdfPoint(160, 695), font);
+        page.AddText("300", 9, new PdfPoint(320, 695), font);
+
+        page.AddText("96", 9, new PdfPoint(30, 675), font);
+        page.AddText("11008N", 9, new PdfPoint(80, 675), font);
+        page.AddText("CAUSTIC", 9, new PdfPoint(160, 675), font);
+        page.AddText("150", 9, new PdfPoint(320, 675), font);
+
+        page.AddText("97", 9, new PdfPoint(30, 655), font);
+        page.AddText("11210NX", 9, new PdfPoint(80, 655), font);
+        page.AddText("SULPHUR", 9, new PdfPoint(160, 655), font);
+        page.AddText("150", 9, new PdfPoint(320, 655), font);
+
+        File.WriteAllBytes(pdfPath, builder.Build());
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+        var row94 = result.Pages[0].TableRows.FirstOrDefault(r => r[0] == "94");
+
+        Assert.NotNull(row94);
+        Assert.Contains("COOLING WATER WASH DOWN", row94!);
+    }
+
+    [Fact]
+    public async Task SplitZones_SeparatesLeftNotesFromRightMatrix()
+    {
+        var pdfPath = Path.Combine(_tempDir, "split_zones.pdf");
+        var builder = new PdfDocumentBuilder();
+        var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+        var page = builder.AddPage(PageSize.A4);
+
+        // Left zone (X = 40..170)
+        page.AddText("Notes", 10, new PdfPoint(40, 700), font);
+        page.AddText("Design limits", 9, new PdfPoint(40, 680), font);
+        page.AddText("For bending", 9, new PdfPoint(40, 660), font);
+        page.AddText("Table schedules", 9, new PdfPoint(40, 640), font);
+        page.AddText("DN 15 160", 9, new PdfPoint(40, 620), font);
+
+        // Right zone (X = 330..500), wide > 150pt vertical gutter
+        page.AddText("Branch connections", 10, new PdfPoint(330, 700), font);
+        page.AddText("Run 600 N P E", 9, new PdfPoint(330, 680), font);
+        page.AddText("Run 500 N P E", 9, new PdfPoint(330, 660), font);
+        page.AddText("Code Explanation", 9, new PdfPoint(330, 640), font);
+        page.AddText("A Equal tee", 9, new PdfPoint(330, 620), font);
+
+        File.WriteAllBytes(pdfPath, builder.Build());
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+
+        Assert.Contains("Left Zone", result.RawExtractedText);
+        Assert.Contains("Right Zone", result.RawExtractedText);
     }
 }

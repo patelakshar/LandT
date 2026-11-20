@@ -42,3 +42,7 @@ ilovepdf_jpg-to-pdf/
 *.csv
 *.apk
 PDF_KING_BY_AP-main/
+
+# Local macOS installers and tools
+*.dmg
+AUTOCUT/
