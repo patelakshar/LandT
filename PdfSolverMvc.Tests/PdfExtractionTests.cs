@@ -359,4 +359,21 @@ public class PdfExtractionTests : IDisposable
         Assert.Contains("WP316", result.RawExtractedText);
         Assert.Contains("33421N", result.RawExtractedText);
     }
+
+    [Fact]
+    public async Task Pms4_ExcludesStruckOutRows100To106()
+    {
+        var pdfPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "kaa-main", "4_PDFsam_Extracted PMS 2_1.pdf"));
+        if (!File.Exists(pdfPath)) return;
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+
+        Assert.Contains("17320NX", result.RawExtractedText);
+        Assert.DoesNotContain("31177NX3", result.RawExtractedText);
+        Assert.DoesNotContain("11057NX", result.RawExtractedText);
+        Assert.DoesNotContain("17011X", result.RawExtractedText);
+    }
 }
