@@ -358,6 +358,10 @@ public class PdfExtractionTests : IDisposable
         Assert.DoesNotContain("WP316L", result.RawExtractedText);
         Assert.Contains("WP316", result.RawExtractedText);
         Assert.Contains("33421N", result.RawExtractedText);
+        Assert.Contains("DN 15-300", result.RawExtractedText);
+        Assert.Contains("DN 350-600", result.RawExtractedText);
+        Assert.Contains("DN 20-300", result.RawExtractedText);
+        Assert.Contains("WP/WX-316", result.RawExtractedText);
     }
 
     [Fact]

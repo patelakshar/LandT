@@ -1107,6 +1107,15 @@ public class PdfExtractionService : IPdfExtractionService
                     currentText.Append(' ').Append(curr.Text);
                     cellRight = Math.Max(cellRight, curr.Right);
                 }
+                else if (ShouldJoinAcrossStrikeGap(currentText.ToString(), curr.Text, gap, medianHeight))
+                {
+                    if (currentText.Length > 0 && currentText[^1] == '-' && curr.Text.StartsWith('/'))
+                    {
+                        currentText.Length--;
+                    }
+                    currentText.Append(curr.Text);
+                    cellRight = Math.Max(cellRight, curr.Right);
+                }
                 else
                 {
                     tokens.Add(new CellToken(cellLeft, cellRight, (cellLeft + cellRight) / 2.0, NormalizeSpaces(currentText.ToString())));
@@ -1479,6 +1488,15 @@ public class PdfExtractionService : IPdfExtractionService
                     currentText.Append(' ').Append(curr.Text);
                     cellRight = Math.Max(cellRight, curr.Right);
                 }
+                else if (ShouldJoinAcrossStrikeGap(currentText.ToString(), curr.Text, gap, medianHeight))
+                {
+                    if (currentText.Length > 0 && currentText[^1] == '-' && curr.Text.StartsWith('/'))
+                    {
+                        currentText.Length--;
+                    }
+                    currentText.Append(curr.Text);
+                    cellRight = Math.Max(cellRight, curr.Right);
+                }
                 else
                 {
                     cells.Add(new CellToken(cellLeft, cellRight, (cellLeft + cellRight) / 2.0, NormalizeSpaces(currentText.ToString())));
@@ -1648,6 +1666,29 @@ public class PdfExtractionService : IPdfExtractionService
         }
 
         return (textBuilder.ToString().Trim(), compactRows);
+    }
+
+    private static bool ShouldJoinAcrossStrikeGap(string leftText, string rightText, double gap, double medianHeight)
+    {
+        if (gap < 0 || gap > Math.Max(28.0, medianHeight * 4.5)) return false;
+        if (string.IsNullOrWhiteSpace(leftText) || string.IsNullOrWhiteSpace(rightText)) return false;
+
+        var left = leftText.TrimEnd();
+        var right = rightText.TrimStart();
+
+        // Case 1: Left ends with '-' (e.g. 'DN 15-') and right starts with a digit or '/' (e.g. '300' or '/WX-316')
+        if (left.Length >= 2 && left[^1] == '-' && (char.IsDigit(right[0]) || right[0] == '/'))
+        {
+            return true;
+        }
+
+        // Case 2: Left ends with a digit (e.g. 'DN 350') and right starts with '-' + digit (e.g. '-600')
+        if (char.IsDigit(left[^1]) && right.Length >= 2 && right[0] == '-' && char.IsDigit(right[1]))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
