@@ -58,8 +58,8 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite(connectionString));
 
 builder.Services.AddScoped<IOcrService, OcrService>();
+builder.Services.AddHttpClient<IGeminiService, GeminiService>();
 builder.Services.AddScoped<IPdfExtractionService, PdfExtractionService>();
-builder.Services.AddScoped<ITextPdfService>();
 
 var app = builder.Build();
 

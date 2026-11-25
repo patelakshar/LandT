@@ -15,20 +15,17 @@ public class PdfController : Controller
     private readonly IPdfExtractionService _extractionService;
     private readonly IWebHostEnvironment _env;
     private readonly IConfiguration _configuration;
-    private readonly ILogger<PdfController> _logger;
 
     public PdfController(
         AppDbContext db,
         IPdfExtractionService extractionService,
         IWebHostEnvironment env,
-        IConfiguration configuration,
-        ILogger<PdfController> logger)
+        IConfiguration configuration)
     {
         _db = db;
         _extractionService = extractionService;
         _env = env;
         _configuration = configuration;
-        _logger = logger;
     }
 
     private string GetUploadFolder()
@@ -86,12 +83,12 @@ public class PdfController : Controller
                 await file.CopyToAsync(stream, cancellationToken);
             }
 
-            _logger.LogInformation("[PDF] 1. Upload: Saved '{File}' ({SizeKb:F1} KB) -> UploadedPdfs/{Stored}",
-                Path.GetFileName(file.FileName), file.Length / 1024.0, storedFileName);
-
             var imageFolder = GetImageFolderForStoredFile(storedFileName);
             var extraction = await _extractionService.ExtractAsync(fullPath, imageFolder, cancellationToken);
 
+            // Arrange extracted data for storage and display:
+            // - RawExtractedText: pipe-delimited ('|') text across all pages for search & .txt export
+            // - PageTextsJson: serialized List<PdfPageContent>, where each page holds a uniform 2D TableRows grid (List<List<string>>) for the UI table & CSV export
             var record = new PdfDocumentRecord
             {
                 OriginalFileName = Path.GetFileName(file.FileName),
@@ -109,9 +106,6 @@ public class PdfController : Controller
             _db.PdfDocuments.Add(record);
             await _db.SaveChangesAsync(cancellationToken);
             createdIds.Add(record.Id);
-
-            _logger.LogInformation("[PDF] 4. Save: Stored Id={Id} in SQLite (pdfsolver.db -> PdfDocuments, {JsonKb:F1} KB JSON)",
-                record.Id, (record.PageTextsJson?.Length ?? 0) / 1024.0);
         }
 
         if (createdIds.Count == 0)

@@ -2,6 +2,12 @@ using System.ComponentModel.DataAnnotations;
 
 namespace PdfSolverMvc.Models;
 
+/// <summary>
+/// SQLite entity representing an uploaded PDF and its arranged extraction output.
+/// Extracted pages are stored in PageTextsJson as a serialized List&lt;PdfPageContent&gt;,
+/// where each page holds a uniform 2D grid (TableRows) for table rendering and CSV export,
+/// plus RawExtractedText for full-document search and plain-text export.
+/// </summary>
 public class PdfDocumentRecord
 {
     public int Id { get; set; }

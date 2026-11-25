@@ -11,19 +11,34 @@ using UglyToad.PdfPig.DocumentLayoutAnalysis.WordExtractor;
 
 namespace PdfSolverMvc.Services;
 
+/// <summary>
+/// Core PDF extraction pipeline. Arranges raw PDF content into structured per-page grids:
+/// 1. Reads vector letters/paths with PdfPig (or falls back to PDFtoImage + SkiaSharp + Tesseract OCR).
+/// 2. Detects page zones (bordered tables, multi-zone splits, prose, or column-aligned matrices).
+/// 3. Groups words by Y-center into rows and X-position into columns, padding each row to a uniform
+///    2D grid (List&lt;List&lt;string&gt;&gt;) so blank cells stay aligned for UI tables and CSV export.
+/// 4. Optionally refines/extracts each page via Gemini AI and combines all pages into PdfExtractionResult.
+/// </summary>
 public class PdfExtractionService : IPdfExtractionService
 {
     private readonly IOcrService _ocrService;
+    private readonly IGeminiService? _geminiService;
     private readonly int _minSelectableCharsPerPage;
+    private readonly float _minGeminiOcrConfidence;
+    private readonly bool _alwaysExtractEveryPage;
     private readonly ILogger<PdfExtractionService> _logger;
 
     public PdfExtractionService(
         IOcrService ocrService,
         IConfiguration configuration,
-        ILogger<PdfExtractionService> logger)
+        ILogger<PdfExtractionService> logger,
+        IGeminiService? geminiService = null)
     {
         _ocrService = ocrService;
+        _geminiService = geminiService;
         _minSelectableCharsPerPage = Math.Max(1, configuration.GetValue<int?>("Ocr:MinSelectableCharsPerPage") ?? 15);
+        _minGeminiOcrConfidence = Math.Clamp(configuration.GetValue<float?>("Gemini:MinOcrConfidenceForAutoFallback") ?? 0.65f, 0.1f, 0.95f);
+        _alwaysExtractEveryPage = configuration.GetValue<bool?>("Gemini:AlwaysExtractEveryPage") ?? true;
         _logger = logger;
     }
 
@@ -56,10 +71,8 @@ public class PdfExtractionService : IPdfExtractionService
 
         try
         {
-            var fileName = Path.GetFileName(pdfFilePath);
             using var document = PdfDocument.Open(pdfFilePath, new ParsingOptions { UseLenientParsing = true });
             int pageCount = document.NumberOfPages;
-            _logger.LogInformation("[PDF] 2. Inspect: Opened '{File}' ({Pages}p) using PdfPig", fileName, pageCount);
 
             foreach (var page in document.GetPages())
             {
@@ -75,8 +88,51 @@ public class PdfExtractionService : IPdfExtractionService
 
                 if (selectableChars >= _minSelectableCharsPerPage)
                 {
-                    pageContent = ExtractVectorPage(page, streamWords, pageRotation);
+                    PageLayoutPlan? layoutPlan = null;
+                    if (_geminiService is { IsConfigured: true } && (_alwaysExtractEveryPage || !(TryExtractDrawnGridTable(page, streamWords, out var preGridText, out _) && (CountWords(preGridText) / (double)Math.Max(1, streamWords.Count)) >= 0.92)))
+                    {
+                        var fingerprint = BuildLayoutFingerprint(page, streamWords);
+                        layoutPlan = await _geminiService.AnalyzePageLayoutAsync(pdfFilePath, page.Number - 1, fingerprint, cancellationToken);
+                    }
+
+                    pageContent = ExtractVectorPage(page, streamWords, pageRotation, layoutPlan);
                     vectorPages++;
+
+                    // Multi-tool cross-check: if vector text is garbled OR page has a large image with sparse text, cross-check with Tesseract OCR
+                    bool garbledVector = IsTextLikelyGarbled(pageContent.Content);
+                    double pageArea = Math.Max(1.0, page.Width * page.Height);
+                    bool hasLargeImage = extractedImages.Any(img => (img.BoundsWidth * img.BoundsHeight) / pageArea >= 0.30);
+
+                    if (garbledVector || (hasLargeImage && pageContent.WordCount < 60))
+                    {
+                        var ocrCross = await ExtractScannedPageAsync(pdfFilePath, page, streamWords, pageRotation, cancellationToken);
+                        if (ocrCross.ExtractionType.StartsWith("OCR", StringComparison.OrdinalIgnoreCase) &&
+                            (garbledVector || ocrCross.WordCount > pageContent.WordCount * 1.25))
+                        {
+                            if (garbledVector || pageContent.WordCount < 25)
+                            {
+                                ocrCross.ExtractionType = "OCR Fallback (Cross-Checked)";
+                                ocrCross.ExtractionNotes = garbledVector
+                                    ? $"Cross-check: Vector font garbled -> switched to Tesseract OCR (Conf={ocrCross.OcrConfidence:P0})."
+                                    : $"Cross-check: Large image + sparse vector text -> switched to Tesseract OCR (Conf={ocrCross.OcrConfidence:P0}).";
+                                pageContent = ocrCross;
+                                vectorPages--;
+                                ocrPages++;
+                            }
+                            else
+                            {
+                                pageContent.ExtractionType = "Hybrid (Vector + OCR)";
+                                pageContent.Content = $"{pageContent.Content}\n\n--- OCR Cross-Check (Embedded Image/Scan) ---\n{ocrCross.Content}".Trim();
+                                pageContent.TableRows.Add(new List<string> { "[OCR Cross-Check]" });
+                                pageContent.TableRows.AddRange(ocrCross.TableRows);
+                                pageContent.WordCount = CountWords(pageContent.Content);
+                                pageContent.OcrConfidence = ocrCross.OcrConfidence;
+                                pageContent.SelectedPsm = ocrCross.SelectedPsm;
+                                pageContent.ExtractionNotes = $"Cross-check: Merged PdfPig vector text with Tesseract OCR (+{ocrCross.WordCount} OCR words, Conf={ocrCross.OcrConfidence:P0}).";
+                                ocrPages++;
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -97,56 +153,79 @@ public class PdfExtractionService : IPdfExtractionService
                     }
                 }
 
+                // Gemini AI extraction on every page (when AlwaysExtractEveryPage is true) OR when Quality Gate triggers
+                if (_geminiService is { IsConfigured: true })
+                {
+                    var qualityIssue = EvaluatePageQuality(pageContent, streamWords.Count);
+                    bool runGemini = _alwaysExtractEveryPage || !string.IsNullOrWhiteSpace(qualityIssue);
+                    if (runGemini)
+                    {
+                        string aiReason = !string.IsNullOrWhiteSpace(qualityIssue)
+                            ? qualityIssue
+                            : "AlwaysExtractEveryPage enabled";
+
+                        GeminiExtractionResult? aiResult = null;
+                        if (!_alwaysExtractEveryPage && pageContent.OcrConfidence.HasValue && !string.IsNullOrWhiteSpace(pageContent.Content) && pageContent.Content.Length >= 40)
+                        {
+                            aiResult = await _geminiService.RepairTableFromTextAsync(pageContent.Content, aiReason, cancellationToken);
+                        }
+
+                        if (aiResult is not { Success: true })
+                        {
+                            aiResult = await _geminiService.ExtractTableFromPageImageAsync(pdfFilePath, page.Number - 1, aiReason, cancellationToken);
+                        }
+
+                        int aiWordCount = aiResult is { Success: true } ? CountWords(aiResult.Content) : 0;
+                        bool aiHasEnoughWords = streamWords.Count < 15 || aiWordCount >= streamWords.Count * 0.55 || !string.IsNullOrWhiteSpace(qualityIssue);
+
+                        if (aiResult is { Success: true } && aiResult.TableRows.Count > 0 && aiHasEnoughWords)
+                        {
+                            if (pageContent.ExtractionType.StartsWith("Scanned", StringComparison.OrdinalIgnoreCase))
+                            {
+                                emptyScannedPages = Math.Max(0, emptyScannedPages - 1);
+                                ocrPages++;
+                            }
+
+                            pageContent.ExtractionType = "AI (Gemini)";
+                            pageContent.TableRows = aiResult.TableRows;
+                            pageContent.Content = aiResult.Content;
+                            pageContent.WordCount = aiWordCount;
+                            pageContent.ExtractionNotes = string.IsNullOrWhiteSpace(aiResult.Summary)
+                                ? $"Extracted via Gemini AI ({aiReason})."
+                                : $"Extracted via Gemini AI ({aiReason}): {aiResult.Summary}";
+
+                            if (!notes.Contains(pageContent.ExtractionNotes))
+                            {
+                                notes.Add(pageContent.ExtractionNotes);
+                            }
+                        }
+                    }
+                }
+
                 pageContent.Images = extractedImages;
                 pages.Add(pageContent);
-
-                string toolUsed;
-                string whyReason;
-                if (pageContent.ExtractionType.StartsWith("OCR", StringComparison.OrdinalIgnoreCase))
-                {
-                    toolUsed = $"PDFtoImage + SkiaSharp + Tesseract OCR (Conf={pageContent.OcrConfidence:P0}, PSM={pageContent.SelectedPsm})";
-                    whyReason = $"only {selectableChars} selectable chars (<{_minSelectableCharsPerPage}, scanned page)";
-                }
-                else if (pageContent.ExtractionType.StartsWith("Scanned", StringComparison.OrdinalIgnoreCase))
-                {
-                    toolUsed = "Tesseract OCR (unavailable)";
-                    whyReason = $"only {selectableChars} selectable chars (<{_minSelectableCharsPerPage}, tessdata missing)";
-                }
-                else
-                {
-                    toolUsed = $"PdfPig ({pageContent.ExtractionType})";
-                    whyReason = pageContent.ExtractionType.Contains("Bordered", StringComparison.OrdinalIgnoreCase)
-                        ? $"{selectableChars} chars + solid cell borders (page.Paths)"
-                        : pageContent.ExtractionType.Contains("Multi-Zone", StringComparison.OrdinalIgnoreCase)
-                            ? $"{selectableChars} chars + left/right gutter gap"
-                            : $"{selectableChars} chars, no full borders -> tight Y-row & X-col clustering";
-                }
-
-                var imgTool = extractedImages.Count > 0 ? " + PdfPig.GetImages/SkiaSharp" : "";
-
-                _logger.LogInformation(
-                    "[PDF] 3. p{Page}: Tool={Tool}{ImgTool} | Why={Why} | {Rows} rows, {Words} words, {Images} imgs",
-                    pageContent.PageNumber, toolUsed, imgTool, whyReason, pageContent.TableRows.Count, pageContent.WordCount, extractedImages.Count);
 
                 fullTextBuilder.AppendLine($"--- Page {pageContent.PageNumber} ({pageContent.ExtractionType}) ---");
                 fullTextBuilder.AppendLine(pageContent.Content);
                 fullTextBuilder.AppendLine();
             }
 
-            string method = (vectorPages, ocrPages, emptyScannedPages) switch
+            int aiPages = pages.Count(p => p.ExtractionType.StartsWith("AI", StringComparison.OrdinalIgnoreCase));
+            string method = (vectorPages, ocrPages, aiPages, emptyScannedPages) switch
             {
-                (> 0, 0, 0) => "DirectText",
-                (0, > 0, _) => "OcrFallback",
-                (> 0, > 0, _) => "HybridOcr",
-                (_, 0, > 0) => "NeedsOcr",
+                (> 0, 0, 0, 0) => "DirectText",
+                (0, > 0, > 0, _) => "AiEnhancedOcr",
+                (> 0, _, > 0, _) => "HybridAi",
+                (0, 0, > 0, _) => "AiRescue",
+                (0, > 0, 0, _) => "OcrFallback",
+                (> 0, > 0, 0, _) => "HybridOcr",
+                (_, 0, 0, > 0) => "NeedsOcr",
                 _ => "DirectText"
             };
 
             string status = emptyScannedPages > 0 && vectorPages == 0 && ocrPages == 0
                 ? "PartialOcrNeeded"
                 : "Processed";
-
-            _logger.LogInformation("[PDF]    Summary: Method={Method}, Status={Status}", method, status);
 
             return new PdfExtractionResult(
                 pageCount,
@@ -222,10 +301,12 @@ public class PdfExtractionService : IPdfExtractionService
             double avgCharWidth = Math.Max(charHeight * 0.48, prevBox.Width);
             double dy = Math.Abs(box.Bottom - prevBox.Bottom);
             double dx = box.Left - prevBox.Right;
+            bool isPunctJoin = ".,-/():".Contains(letter.Value) || ".,-/(".Contains(prev.Value);
+            double maxDx = isPunctJoin ? avgCharWidth * 1.15 : avgCharWidth * 0.72;
 
             bool sameWord = dy <= charHeight * 0.45 &&
                             dx >= -avgCharWidth * 0.45 &&
-                            dx <= avgCharWidth * 0.65;
+                            dx <= maxDx;
 
             if (sameWord)
             {
@@ -372,30 +453,128 @@ public class PdfExtractionService : IPdfExtractionService
         return string.IsNullOrWhiteSpace(text) ? null : text;
     }
 
-    private static PdfPageContent ExtractVectorPage(Page page, List<WordBox> streamWords, double pageRotation)
+    private string? EvaluatePageQuality(PdfPageContent pageContent, int rawWordCount)
+    {
+        if (pageContent.WordCount == 0) return "0 extracted words";
+        if (IsTextLikelyGarbled(pageContent.Content)) return "garbled vector text";
+        if (pageContent.ExtractionType.StartsWith("Scanned", StringComparison.OrdinalIgnoreCase)) return "local OCR unavailable";
+        if (pageContent.OcrConfidence.HasValue && pageContent.OcrConfidence.Value < _minGeminiOcrConfidence)
+            return $"low OCR confidence ({pageContent.OcrConfidence:P0})";
+
+        if (rawWordCount >= 20)
+        {
+            double coverage = pageContent.WordCount / (double)rawWordCount;
+            if (coverage < 0.80)
+                return $"low word coverage ({coverage:P0})";
+        }
+
+        var rows = pageContent.TableRows;
+        if (rows != null && rows.Count >= 10 && !pageContent.ExtractionType.Contains("Bordered", StringComparison.OrdinalIgnoreCase))
+        {
+            int maxCols = rows.Max(r => r.Count);
+            double avgNonEmpty = rows.Average(r => r.Count(c => !string.IsNullOrWhiteSpace(c)));
+
+            if (maxCols >= 20 && avgNonEmpty < 2.5)
+                return $"column explosion ({maxCols} cols, avg {avgNonEmpty:F1} cells/row)";
+
+            // Detect merged multi-code cells (e.g., "4121S 4141S 4161S" crammed in one cell)
+            int multiCodeCells = rows.Sum(r => r.Count(c =>
+                !string.IsNullOrWhiteSpace(c) &&
+                Regex.IsMatch(c.Trim(), @"^(?:[A-Z0-9-]{2,8}\s+){2,}[A-Z0-9-]{2,8}$")));
+            if (multiCodeCells >= 3)
+                return $"merged multi-code cells ({multiCodeCells} cells)";
+
+            if (!pageContent.ExtractionType.Contains("Prose", StringComparison.OrdinalIgnoreCase))
+            {
+                int scatteredProseRows = rows.Count(r =>
+                    r.Count(c => !string.IsNullOrWhiteSpace(c)) >= 4 &&
+                    r.Count(c => !string.IsNullOrWhiteSpace(c) && Regex.IsMatch(c.Trim(), @"^[a-z]{3,}")) >= 3);
+                if (scatteredProseRows >= 2)
+                    return $"prose sentences split across {maxCols} columns";
+
+                int tinyRows = rows.Count(r =>
+                {
+                    int w = r.Sum(c => CountWords(c));
+                    return w is >= 1 and <= 2;
+                });
+                if (tinyRows / (double)rows.Count > 0.60 && avgNonEmpty <= 1.6)
+                    return $"fragmented rows ({tinyRows}/{rows.Count} tiny rows)";
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsTextLikelyGarbled(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        int total = 0;
+        int readable = 0;
+        foreach (char ch in text)
+        {
+            if (char.IsWhiteSpace(ch)) continue;
+            total++;
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+                ".,;:-/()[]%+°&'".Contains(ch))
+            {
+                readable++;
+            }
+        }
+        return total >= 15 && (readable / (double)total) < 0.55;
+    }
+
+    private static string BuildLayoutFingerprint(Page page, List<WordBox> words)
+    {
+        int wBucket = (int)(Math.Round(page.Width / 25.0) * 25);
+        int hBucket = (int)(Math.Round(page.Height / 25.0) * 25);
+        int pathBucket = (page.Paths?.Count ?? 0) switch
+        {
+            0 => 0,
+            <= 10 => 1,
+            <= 60 => 2,
+            _ => 3
+        };
+        int wordBucket = words.Count / 40;
+        return $"{wBucket}x{hBucket}_p{pathBucket}_w{wordBucket}";
+    }
+
+    private static PdfPageContent ExtractVectorPage(Page page, List<WordBox> streamWords, double pageRotation, PageLayoutPlan? layoutPlan = null)
     {
         string alignedText;
         List<List<string>> tableRows;
         string modeLabel;
-        string? modeNote = null;
+        var notes = new List<string>();
+        int streamWordCount = Math.Max(1, streamWords.Count);
 
-        if (TryExtractDrawnGridTable(page, streamWords, out var gridText, out var gridRows))
+        if (layoutPlan is { Success: true } && layoutPlan.PageType == "prose")
         {
-            alignedText = gridText;
-            tableRows = gridRows;
-            modeLabel = pageRotation != 0 ? $"Vector Grid (Rotated {pageRotation:0}°)" : "Vector (Bordered Grid)";
+            (alignedText, tableRows) = ExtractProseRows(streamWords);
+            modeLabel = "Vector (AI-Guided Prose)";
+            notes.Add(layoutPlan.FromCache
+                ? "Reused learned prose layout (0 tokens)."
+                : $"AI Layout Analyzer detected prose: {layoutPlan.Notes}");
         }
-        else if (TryExtractSplitZones(page, streamWords, out var zoneText, out var zoneRows))
+        else if (layoutPlan is { Success: true, Zones.Count: >= 2 } && TryExtractMultiToolZones(page, streamWords, layoutPlan, out var multiText, out var multiRows, out var toolsSummary))
         {
-            alignedText = zoneText;
-            tableRows = zoneRows;
-            modeLabel = pageRotation != 0 ? $"Vector Multi-Zone (Rotated {pageRotation:0}°)" : "Vector (Multi-Zone Grid)";
-            modeNote = "Detected left/right page zones; extracted independently.";
+            int multiWords = CountWords(multiText);
+            double coverage = multiWords / (double)streamWordCount;
+            if (coverage >= 0.78)
+            {
+                alignedText = multiText;
+                tableRows = multiRows;
+                modeLabel = $"Multi-Tool ({toolsSummary})";
+                notes.Add(layoutPlan.FromCache
+                    ? $"Reused learned {layoutPlan.Zones.Count}-zone plan ({Math.Min(100, (int)Math.Round(coverage * 100))}% coverage)."
+                    : $"AI-guided {layoutPlan.Zones.Count}-zone multi-tool extraction ({Math.Min(100, (int)Math.Round(coverage * 100))}% coverage).");
+            }
+            else
+            {
+                (alignedText, tableRows, modeLabel) = RunLocalMultiToolCrossCheck(page, streamWords, pageRotation, layoutPlan, notes);
+            }
         }
         else
         {
-            (alignedText, tableRows) = ExtractColumnAlignedGrid(streamWords);
-            modeLabel = pageRotation != 0 ? $"Vector (Rotated {pageRotation:0}°)" : "Vector (Column-Grid)";
+            (alignedText, tableRows, modeLabel) = RunLocalMultiToolCrossCheck(page, streamWords, pageRotation, layoutPlan, notes);
         }
 
         var nnWords = NearestNeighbourWordExtractor.Instance.GetWords(page.Letters);
@@ -408,9 +587,7 @@ public class PdfExtractionService : IPdfExtractionService
         var finalText = !string.IsNullOrWhiteSpace(alignedText) ? alignedText : readingOrderText;
         var wordCount = CountWords(finalText);
 
-        var notes = new List<string>();
         if (pageRotation != 0) notes.Add($"Vector page rotated {pageRotation:0}°; coordinates normalized.");
-        if (!string.IsNullOrWhiteSpace(modeNote)) notes.Add(modeNote);
 
         return new PdfPageContent
         {
@@ -423,6 +600,186 @@ public class PdfExtractionService : IPdfExtractionService
             RotationDegrees = pageRotation,
             ExtractionNotes = notes.Count > 0 ? string.Join(" ", notes) : null
         };
+    }
+
+    private static (string Text, List<List<string>> Rows, string ModeLabel) RunLocalMultiToolCrossCheck(
+        Page page,
+        List<WordBox> streamWords,
+        double pageRotation,
+        PageLayoutPlan? layoutPlan,
+        List<string> notes)
+    {
+        int streamWordCount = Math.Max(1, streamWords.Count);
+        double? forcedSplitX = layoutPlan is { Success: true, SplitXPct: not null }
+            ? page.Width * layoutPlan.SplitXPct.Value
+            : null;
+
+        if (TryExtractDrawnGridTable(page, streamWords, out var gridText, out var gridRows))
+        {
+            int gridWords = CountWords(gridText);
+            double coverage = gridWords / (double)streamWordCount;
+            if (coverage < 0.80)
+            {
+                var (colText, colRows) = ExtractColumnAlignedGrid(streamWords);
+                if (CountWords(colText) > gridWords)
+                {
+                    notes.Add($"Cross-check: Bordered Grid covered {coverage:P0} of words; fell back to Column-Grid.");
+                    return (colText, colRows, pageRotation != 0 ? $"Vector (Rotated {pageRotation:0}°)" : "Vector (Column-Grid Fallback)");
+                }
+            }
+
+            notes.Add($"Cross-check: Bordered Grid verified ({Math.Min(100, (int)Math.Round(coverage * 100))}% word coverage).");
+            return (gridText, gridRows, pageRotation != 0 ? $"Vector Grid (Rotated {pageRotation:0}°)" : "Vector (Bordered Grid)");
+        }
+
+        if (TryExtractSplitZones(page, streamWords, out var zoneText, out var zoneRows, forcedSplitX))
+        {
+            int zoneWords = CountWords(zoneText);
+            double coverage = zoneWords / (double)streamWordCount;
+            if (coverage < 0.85)
+            {
+                var (colText, colRows) = ExtractColumnAlignedGrid(streamWords);
+                if (CountWords(colText) > zoneWords * 1.1)
+                {
+                    notes.Add($"Cross-check: Multi-Zone covered {coverage:P0}; fell back to Column-Grid.");
+                    return (colText, colRows, pageRotation != 0 ? $"Vector (Rotated {pageRotation:0}°)" : "Vector (Column-Grid Fallback)");
+                }
+            }
+
+            notes.Add("Detected left/right page zones; cross-checked word coverage.");
+            return (zoneText, zoneRows, pageRotation != 0 ? $"Vector Multi-Zone (Rotated {pageRotation:0}°)" : "Vector (Multi-Zone Grid)");
+        }
+
+        var (alignedText, tableRows) = ExtractColumnAlignedGrid(streamWords);
+        var modeLabel = pageRotation != 0 ? $"Vector (Rotated {pageRotation:0}°)" : "Vector (Column-Grid)";
+        return (alignedText, tableRows, modeLabel);
+    }
+
+    private static bool TryExtractMultiToolZones(
+        Page page,
+        List<WordBox> allWords,
+        PageLayoutPlan plan,
+        out string combinedText,
+        out List<List<string>> combinedRows,
+        out string toolsSummary)
+    {
+        combinedText = string.Empty;
+        combinedRows = new List<List<string>>();
+        toolsSummary = string.Empty;
+
+        var claimed = new HashSet<WordBox>();
+        var usedTools = new List<string>();
+        var sb = new StringBuilder();
+
+        var orderedZones = plan.Zones
+            .OrderBy(z => z.YTopPct)
+            .ThenBy(z => z.XLeftPct)
+            .ToList();
+
+        foreach (var zone in orderedZones)
+        {
+            double xMin = page.Width * zone.XLeftPct - 4.0;
+            double xMax = page.Width * zone.XRightPct + 4.0;
+            double yTop = page.Height * (1.0 - zone.YTopPct) + 4.0;
+            double yBot = page.Height * (1.0 - zone.YBottomPct) - 4.0;
+
+            var zoneWords = allWords
+                .Where(w => !claimed.Contains(w))
+                .Where(w =>
+                {
+                    double cx = (w.Left + w.Right) / 2.0;
+                    double cy = (w.Bottom + w.Top) / 2.0;
+                    return cx >= xMin && cx <= xMax && cy >= yBot && cy <= yTop;
+                })
+                .ToList();
+
+            if (zoneWords.Count == 0) continue;
+            foreach (var w in zoneWords) claimed.Add(w);
+
+            string zoneText;
+            List<List<string>> zoneRows;
+            string toolLabel;
+
+            if (zone.Tool == "bordered" && TryExtractDrawnGridTable(page, zoneWords, out var bText, out var bRows))
+            {
+                zoneText = bText;
+                zoneRows = bRows;
+                toolLabel = "Bordered";
+            }
+            else if (zone.Tool == "prose")
+            {
+                (zoneText, zoneRows) = ExtractProseRows(zoneWords);
+                toolLabel = "Prose";
+            }
+            else
+            {
+                (zoneText, zoneRows) = ExtractColumnAlignedGrid(zoneWords);
+                toolLabel = "Column-Grid";
+            }
+
+            if (zoneRows.Count == 0) continue;
+            if (!usedTools.Contains(toolLabel)) usedTools.Add(toolLabel);
+
+            combinedRows.Add(new List<string> { $"[{zone.Name} - {toolLabel}]" });
+            combinedRows.AddRange(zoneRows);
+            sb.AppendLine($"[{zone.Name} - {toolLabel}]");
+            sb.AppendLine(zoneText);
+            sb.AppendLine();
+        }
+
+        var unclaimed = allWords.Where(w => !claimed.Contains(w)).ToList();
+        if (unclaimed.Count >= 5)
+        {
+            var (extraText, extraRows) = ExtractColumnAlignedGrid(unclaimed);
+            if (extraRows.Count > 0)
+            {
+                combinedRows.Add(new List<string> { "[Additional Text - Column-Grid]" });
+                combinedRows.AddRange(extraRows);
+                sb.AppendLine("[Additional Text - Column-Grid]");
+                sb.AppendLine(extraText);
+            }
+        }
+
+        if (combinedRows.Count == 0) return false;
+
+        int maxCols = combinedRows.Max(r => r.Count);
+        foreach (var row in combinedRows)
+        {
+            while (row.Count < maxCols) row.Add(string.Empty);
+        }
+
+        toolsSummary = string.Join(" + ", usedTools);
+        combinedText = sb.ToString().Trim();
+        return true;
+    }
+
+    private static (string Text, List<List<string>> Rows) ExtractProseRows(List<WordBox> words)
+    {
+        if (words.Count == 0) return (string.Empty, new List<List<string>>());
+
+        var heights = words.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
+        double medianHeight = heights.Count > 0 ? heights[heights.Count / 2] : 9.0;
+        double yTol = Math.Clamp(medianHeight * 0.45, 1.5, 4.0);
+
+        var lines = new List<List<WordBox>>();
+        foreach (var w in words.OrderByDescending(w => (w.Bottom + w.Top) / 2.0))
+        {
+            double cy = (w.Bottom + w.Top) / 2.0;
+            var row = lines.FirstOrDefault(r => Math.Abs(((r[0].Bottom + r[0].Top) / 2.0) - cy) <= yTol);
+            if (row != null) row.Add(w);
+            else lines.Add(new List<WordBox> { w });
+        }
+
+        var rows = new List<List<string>>();
+        var sb = new StringBuilder();
+        foreach (var line in lines)
+        {
+            var text = NormalizeSpaces(string.Join(" ", line.OrderBy(w => w.Left).Select(w => w.Text)));
+            if (string.IsNullOrWhiteSpace(text)) continue;
+            rows.Add(new List<string> { text });
+            sb.AppendLine(text);
+        }
+        return (sb.ToString().Trim(), rows);
     }
 
     /// <summary>
@@ -578,15 +935,18 @@ public class PdfExtractionService : IPdfExtractionService
 
         var heights = bandWords.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
         double medianHeight = heights.Count > 0 ? heights[heights.Count / 2] : 8.0;
-        double yTolerance = Math.Clamp(medianHeight * 0.30, 0.8, 2.5);
+        double yTolerance = Math.Clamp(medianHeight * 0.40, 1.2, 3.0);
 
         var rawRows = new List<List<WordBox>>();
-        foreach (var word in bandWords.OrderByDescending(w => w.Bottom))
+        foreach (var word in bandWords.OrderByDescending(w => (w.Bottom + w.Top) / 2.0))
         {
-            var matchingRow = rawRows.FirstOrDefault(r => Math.Abs(r[0].Bottom - word.Bottom) <= yTolerance);
+            double wordCenterY = (word.Bottom + word.Top) / 2.0;
+            var matchingRow = rawRows.FirstOrDefault(r => Math.Abs(((r[0].Bottom + r[0].Top) / 2.0) - wordCenterY) <= yTolerance);
             if (matchingRow != null) matchingRow.Add(word);
             else rawRows.Add(new List<WordBox> { word });
         }
+
+        double maxSameCellGap = Math.Max(4.2, medianHeight * 0.62);
 
         foreach (var row in rawRows)
         {
@@ -603,9 +963,8 @@ public class PdfExtractionService : IPdfExtractionService
                 var prev = ordered[i - 1];
                 var curr = ordered[i];
                 double gap = curr.Left - prev.Right;
-                double avgCharWidth = Math.Max(2.2, prev.Width / Math.Max(1, prev.Text.Length));
 
-                if (gap >= -1.5 && gap <= Math.Max(4.5, avgCharWidth * 1.9))
+                if (gap >= -1.5 && gap <= maxSameCellGap)
                 {
                     currentText.Append(' ').Append(curr.Text);
                     cellRight = Math.Max(cellRight, curr.Right);
@@ -710,7 +1069,8 @@ public class PdfExtractionService : IPdfExtractionService
         Page page,
         List<WordBox> words,
         out string combinedText,
-        out List<List<string>> combinedRows)
+        out List<List<string>> combinedRows,
+        double? forcedSplitX = null)
     {
         double pageWidth = page.Width;
         double pageHeight = page.Height;
@@ -731,26 +1091,28 @@ public class PdfExtractionService : IPdfExtractionService
             return false;
         }
 
-        var heights = bodyWords.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
-        double medianHeight = heights.Count > 0 ? heights[heights.Count / 2] : 8.0;
-        double minGutterWidth = Math.Max(28.0, medianHeight * 3.5);
-
-        double bestGutterX = -1;
-        double bestGutterWidth = 0;
-
-        for (double x = pageWidth * 0.25; x <= pageWidth * 0.75; x += 4.0)
+        double bestGutterX = forcedSplitX ?? -1;
+        if (bestGutterX < 0)
         {
-            var leftMax = bodyWords.Where(w => w.Right <= x).Select(w => w.Right).DefaultIfEmpty(0).Max();
-            var rightMin = bodyWords.Where(w => w.Left >= x).Select(w => w.Left).DefaultIfEmpty(pageWidth).Min();
-            var crossing = bodyWords.Count(w => w.Left < x && w.Right > x);
+            var heights = bodyWords.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
+            double medianHeight = heights.Count > 0 ? heights[heights.Count / 2] : 8.0;
+            double minGutterWidth = Math.Max(28.0, medianHeight * 3.5);
+            double bestGutterWidth = 0;
 
-            if (crossing == 0)
+            for (double x = pageWidth * 0.25; x <= pageWidth * 0.75; x += 4.0)
             {
-                double gap = rightMin - leftMax;
-                if (gap >= minGutterWidth && gap > bestGutterWidth)
+                var leftMax = bodyWords.Where(w => w.Right <= x).Select(w => w.Right).DefaultIfEmpty(0).Max();
+                var rightMin = bodyWords.Where(w => w.Left >= x).Select(w => w.Left).DefaultIfEmpty(pageWidth).Min();
+                var crossing = bodyWords.Count(w => w.Left < x && w.Right > x);
+
+                if (crossing == 0)
                 {
-                    bestGutterWidth = gap;
-                    bestGutterX = (leftMax + rightMin) / 2.0;
+                    double gap = rightMin - leftMax;
+                    if (gap >= minGutterWidth && gap > bestGutterWidth)
+                    {
+                        bestGutterWidth = gap;
+                        bestGutterX = (leftMax + rightMin) / 2.0;
+                    }
                 }
             }
         }
@@ -913,15 +1275,16 @@ public class PdfExtractionService : IPdfExtractionService
 
         var heights = words.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
         double medianHeight = heights.Count > 0 ? heights[heights.Count / 2] : 8.0;
-        double yTolerance = Math.Clamp(medianHeight * 0.30, 0.8, 2.5);
+        double yTolerance = Math.Clamp(medianHeight * 0.48, 1.5, 3.6);
 
-        var sortedByY = words.OrderByDescending(w => w.Bottom).ToList();
+        var sortedByY = words.OrderByDescending(w => (w.Bottom + w.Top) / 2.0).ToList();
         var rawRows = new List<List<WordBox>>();
 
         foreach (var word in sortedByY)
         {
+            double wordCenterY = (word.Bottom + word.Top) / 2.0;
             var matchingRow = rawRows.FirstOrDefault(r =>
-                Math.Abs(r[0].Bottom - word.Bottom) <= yTolerance);
+                Math.Abs(((r[0].Bottom + r[0].Top) / 2.0) - wordCenterY) <= yTolerance);
 
             if (matchingRow != null)
             {
@@ -933,11 +1296,12 @@ public class PdfExtractionService : IPdfExtractionService
             }
         }
 
+        double maxSameCellGap = Math.Max(4.2, medianHeight * 0.62);
         var rowTokens = new List<List<CellToken>>();
         var rawRowYs = new List<double>();
         foreach (var row in rawRows)
         {
-            rawRowYs.Add(row.Average(w => w.Bottom));
+            rawRowYs.Add(row.Average(w => (w.Bottom + w.Top) / 2.0));
             var ordered = row.OrderBy(w => w.Left).ToList();
             var cells = new List<CellToken>();
 
@@ -950,9 +1314,8 @@ public class PdfExtractionService : IPdfExtractionService
                 var prev = ordered[i - 1];
                 var curr = ordered[i];
                 double gap = curr.Left - prev.Right;
-                double avgCharWidth = Math.Max(2.2, prev.Width / Math.Max(1, prev.Text.Length));
 
-                if (gap >= -1.5 && gap <= Math.Max(4.5, avgCharWidth * 1.9))
+                if (gap >= -1.5 && gap <= maxSameCellGap)
                 {
                     currentText.Append(' ').Append(curr.Text);
                     cellRight = Math.Max(cellRight, curr.Right);
@@ -974,25 +1337,71 @@ public class PdfExtractionService : IPdfExtractionService
             }
         }
 
-        var allCells = rowTokens.SelectMany(r => r).OrderBy(c => c.Right - c.Left).ToList();
+        static bool IsProseNoteRow(List<CellToken> rowTokensOnLine, double medH)
+        {
+            if (rowTokensOnLine.Count < 2) return false;
+            var allWords = rowTokensOnLine.SelectMany(t => t.Text.Split(' ', StringSplitOptions.RemoveEmptyEntries)).ToList();
+            if (allWords.Count < 4) return false;
+
+            int lowerWords = allWords.Count(w => Regex.IsMatch(w, @"^[a-z]{3,}[.,;:)]*$"));
+            bool startsLikeBulletOrNote = rowTokensOnLine[0].Text.StartsWith("-") ||
+                                          rowTokensOnLine[0].Text.StartsWith("(") ||
+                                          rowTokensOnLine[0].Text.StartsWith("Notes", StringComparison.OrdinalIgnoreCase);
+
+            if (lowerWords < 3 && !(startsLikeBulletOrNote && lowerWords >= 2))
+                return false;
+
+            for (int i = 1; i < rowTokensOnLine.Count; i++)
+            {
+                if (rowTokensOnLine[i].Left - rowTokensOnLine[i - 1].Right > medH * 2.8)
+                    return false;
+            }
+            return true;
+        }
+
+        var isProseRowFlags = rowTokens.Select(r => IsProseNoteRow(r, medianHeight)).ToList();
+        var tableOnlyTokens = rowTokens
+            .Where((_, idx) => !isProseRowFlags[idx])
+            .SelectMany(r => r)
+            .ToList();
+        if (tableOnlyTokens.Count == 0)
+        {
+            tableOnlyTokens = rowTokens.SelectMany(r => r).ToList();
+        }
+
+        var allCells = tableOnlyTokens.OrderBy(c => c.Right - c.Left).ToList();
+        var leftAnchors = ClusterCoordinates(allCells.Select(c => c.Left).ToList(), tolerance: 4.0)
+            .Where(ax => allCells.Count(c => Math.Abs(c.Left - ax) <= 4.0) >= 3)
+            .ToList();
+
         var columns = new List<ColumnCluster>();
 
         foreach (var cell in allCells)
         {
+            bool cellOnOwnLeftAnchor = leftAnchors.Any(ax => Math.Abs(cell.Left - ax) <= 5.0);
+
             var match = columns
                 .Select(col => new
                 {
                     Col = col,
-                    Overlap = Math.Min(col.MaxRight, cell.Right) - Math.Max(col.MinLeft, cell.Left),
+                    LeftDist = Math.Abs(col.MinLeft - cell.Left),
                     CenterDist = Math.Abs(col.CenterX - cell.CenterX)
                 })
-                .Where(x => x.Overlap > 0 || x.CenterDist <= medianHeight * 1.2)
-                .OrderBy(x => x.CenterDist)
+                .Where(x =>
+                {
+                    if (cellOnOwnLeftAnchor && (cell.Left - x.Col.MinLeft) > medianHeight * 2.0)
+                    {
+                        return false;
+                    }
+                    return x.LeftDist <= medianHeight * 1.4 || x.CenterDist <= medianHeight * 1.2;
+                })
+                .OrderBy(x => x.LeftDist <= medianHeight * 1.4 ? x.LeftDist : x.CenterDist + 100)
                 .FirstOrDefault();
 
             if (match != null)
             {
-                if ((cell.Right - cell.Left) <= (match.Col.MaxRight - match.Col.MinLeft) * 1.8)
+                if ((cell.Right - cell.Left) <= (match.Col.MaxRight - match.Col.MinLeft) * 1.8 &&
+                    (cell.Left - match.Col.MinLeft) <= medianHeight * 1.8)
                 {
                     match.Col.MinLeft = Math.Min(match.Col.MinLeft, cell.Left);
                     match.Col.MaxRight = Math.Max(match.Col.MaxRight, cell.Right);
@@ -1011,29 +1420,40 @@ public class PdfExtractionService : IPdfExtractionService
         for (int rIdx = 0; rIdx < rowTokens.Count; rIdx++)
         {
             var row = rowTokens[rIdx];
-            var gridRow = Enumerable.Repeat(string.Empty, columns.Count).ToList();
-            foreach (var cell in row)
+            var gridRow = Enumerable.Repeat(string.Empty, Math.Max(1, columns.Count)).ToList();
+
+            if (isProseRowFlags[rIdx])
             {
-                int bestCol = 0;
-                double bestScore = double.MaxValue;
-
-                for (int c = 0; c < columns.Count; c++)
+                gridRow[0] = NormalizeSpaces(string.Join(" ", row.Select(c => c.Text)));
+            }
+            else
+            {
+                foreach (var cell in row)
                 {
-                    var col = columns[c];
-                    double overlap = Math.Min(col.MaxRight, cell.Right) - Math.Max(col.MinLeft, cell.Left);
-                    double dist = Math.Abs(col.CenterX - cell.CenterX);
-                    double score = overlap > 0 ? -overlap : dist + 1000;
+                    int bestCol = 0;
+                    double bestScore = double.MaxValue;
 
-                    if (score < bestScore)
+                    for (int c = 0; c < columns.Count; c++)
                     {
-                        bestScore = score;
-                        bestCol = c;
-                    }
-                }
+                        var col = columns[c];
+                        double leftDist = Math.Abs(col.MinLeft - cell.Left);
+                        double overlap = Math.Min(col.MaxRight, cell.Right) - Math.Max(col.MinLeft, cell.Left);
+                        double dist = Math.Abs(col.CenterX - cell.CenterX);
+                        double score = leftDist <= medianHeight * 1.4
+                            ? leftDist - 500
+                            : (overlap > 0 ? -overlap : dist + 1000);
 
-                gridRow[bestCol] = string.IsNullOrEmpty(gridRow[bestCol])
-                    ? cell.Text
-                    : NormalizeSpaces($"{gridRow[bestCol]} {cell.Text}");
+                        if (score < bestScore)
+                        {
+                            bestScore = score;
+                            bestCol = c;
+                        }
+                    }
+
+                    gridRow[bestCol] = string.IsNullOrEmpty(gridRow[bestCol])
+                        ? cell.Text
+                        : NormalizeSpaces($"{gridRow[bestCol]} {cell.Text}");
+                }
             }
 
             if (gridRow.Any(c => !string.IsNullOrWhiteSpace(c)))
