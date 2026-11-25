@@ -96,7 +96,7 @@ public class PdfExtractionService : IPdfExtractionService
                         layoutPlan = await _geminiService.AnalyzePageLayoutAsync(pdfFilePath, page.Number - 1, fingerprint, cancellationToken);
                     }
 
-                    pageContent = ExtractVectorPage(page, streamWords, pageRotation, layoutPlan);
+                    pageContent = ExtractVectorPage(page, filteredLetters, streamWords, pageRotation, layoutPlan);
                     vectorPages++;
 
                     // Multi-tool cross-check: if vector text is garbled OR page has a large image with sparse text, cross-check with Tesseract OCR
@@ -173,7 +173,8 @@ public class PdfExtractionService : IPdfExtractionService
 
                         if (aiResult is not { Success: true })
                         {
-                            aiResult = await _geminiService.ExtractTableFromPageImageAsync(pdfFilePath, page.Number - 1, aiReason, cancellationToken);
+                            var cleanRef = !IsTextLikelyGarbled(pageContent.Content) ? pageContent.Content : null;
+                            aiResult = await _geminiService.ExtractTableFromPageImageAsync(pdfFilePath, page.Number - 1, aiReason, cleanRef, cancellationToken);
                         }
 
                         int aiWordCount = aiResult is { Success: true } ? CountWords(aiResult.Content) : 0;
@@ -288,6 +289,22 @@ public class PdfExtractionService : IPdfExtractionService
                 if (subRect != null)
                 {
                     CollectIfHorizontalStrike(subRect.Value);
+                }
+
+                foreach (var cmd in subpath.Commands)
+                {
+                    if (cmd is PdfSubpath.Line lineCmd)
+                    {
+                        double dx = Math.Abs(lineCmd.To.X - lineCmd.From.X);
+                        double dy = Math.Abs(lineCmd.To.Y - lineCmd.From.Y);
+                        if (dx >= 2.0 && dy <= 2.6)
+                        {
+                            strikeSegments.Add((
+                                Math.Min(lineCmd.From.X, lineCmd.To.X),
+                                Math.Max(lineCmd.From.X, lineCmd.To.X),
+                                (lineCmd.From.Y + lineCmd.To.Y) / 2.0));
+                        }
+                    }
                 }
             }
         }
@@ -647,7 +664,7 @@ public class PdfExtractionService : IPdfExtractionService
         return $"{wBucket}x{hBucket}_p{pathBucket}_w{wordBucket}";
     }
 
-    private static PdfPageContent ExtractVectorPage(Page page, List<WordBox> streamWords, double pageRotation, PageLayoutPlan? layoutPlan = null)
+    private static PdfPageContent ExtractVectorPage(Page page, IReadOnlyList<Letter> filteredLetters, List<WordBox> streamWords, double pageRotation, PageLayoutPlan? layoutPlan = null)
     {
         string alignedText;
         List<List<string>> tableRows;
@@ -686,7 +703,7 @@ public class PdfExtractionService : IPdfExtractionService
             (alignedText, tableRows, modeLabel) = RunLocalMultiToolCrossCheck(page, streamWords, pageRotation, layoutPlan, notes);
         }
 
-        var nnWords = NearestNeighbourWordExtractor.Instance.GetWords(page.Letters);
+        var nnWords = NearestNeighbourWordExtractor.Instance.GetWords(filteredLetters);
         var blocks = DocstrumBoundingBoxes.Instance.GetBlocks(nnWords);
         var orderedBlocks = UnsupervisedReadingOrderDetector.Instance.Get(blocks);
         var readingOrderText = string.Join(

@@ -37,6 +37,7 @@ public interface IGeminiService
         string pdfFilePath,
         int zeroBasedPageIndex,
         string reason,
+        string? cleanReferenceText = null,
         CancellationToken cancellationToken = default);
 
     Task<GeminiExtractionResult> RepairTableFromTextAsync(

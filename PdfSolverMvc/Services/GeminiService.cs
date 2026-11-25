@@ -164,6 +164,7 @@ public sealed class GeminiService : IGeminiService
         string pdfFilePath,
         int zeroBasedPageIndex,
         string reason,
+        string? cleanReferenceText = null,
         CancellationToken cancellationToken = default)
     {
         if (!IsConfigured)
@@ -183,14 +184,18 @@ public sealed class GeminiService : IGeminiService
                 return data.ToArray();
             }, cancellationToken);
 
-            var prompt =
+            var basePrompt =
                 "Extract EVERY SINGLE ROW and ALL text from top to bottom of this engineering PDF page accurately. " +
                 "Do NOT stop early, summarize, or truncate rows. " +
-                "IGNORE and OMIT any text, numbers, or rows that have a horizontal line/strikethrough drawn through them (crossed-out or deleted values in red, blue, or black). " +
-                "For example, if '350' is crossed out in 'DN 15-350-200', output only 'DN 15-200'; if an entire row or note is crossed out, omit it completely. " +
+                "IGNORE and OMIT any text, single letters (like 'L' or 'S'), numbers (like '350'), or rows that have a horizontal line/strikethrough drawn through them (in red, blue, or black). " +
                 "If the page has two side-by-side sections (left panel and right panel), extract all rows of the left section and all rows of the right section without mixing or shifting columns. " +
                 "Return ONLY valid JSON: {\"rows\":[[\"cell1\",\"cell2\"]],\"summary\":\"short 1-line description\"}. " +
                 "Preserve blank cells as \"\" so columns stay aligned. Do not invent values.";
+
+            var prompt = !string.IsNullOrWhiteSpace(cleanReferenceText)
+                ? basePrompt + "\n\nCLEAN REFERENCE TEXT (already has crossed-out/strikethrough text removed — match these exact spellings, numbers, and complete rows; do NOT re-add struck-through text from the image):\n" +
+                  (cleanReferenceText.Length > 12000 ? cleanReferenceText[..12000] : cleanReferenceText)
+                : basePrompt;
 
             var payload = new
             {
