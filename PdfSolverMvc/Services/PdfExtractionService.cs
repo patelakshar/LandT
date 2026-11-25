@@ -78,7 +78,8 @@ public class PdfExtractionService : IPdfExtractionService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var streamWords = BuildStreamOrderedWords(page.Letters);
+                var filteredLetters = FilterOutStrikethroughLetters(page, page.Letters);
+                var streamWords = BuildStreamOrderedWords(filteredLetters);
                 int selectableChars = streamWords.Sum(w => w.Text.Length);
                 double pageRotation = page.Rotation.Value;
 
@@ -176,7 +177,11 @@ public class PdfExtractionService : IPdfExtractionService
                         }
 
                         int aiWordCount = aiResult is { Success: true } ? CountWords(aiResult.Content) : 0;
-                        bool aiHasEnoughWords = streamWords.Count < 15 || aiWordCount >= streamWords.Count * 0.55 || !string.IsNullOrWhiteSpace(qualityIssue);
+                        bool localIsCompleteVector = pageContent.WordCount >= 40 && !IsTextLikelyGarbled(pageContent.Content);
+                        bool aiHasEnoughWords = localIsCompleteVector
+                            ? (aiWordCount >= pageContent.WordCount * 0.78 &&
+                               (pageContent.TableRows.Count < 10 || aiResult!.TableRows.Count >= pageContent.TableRows.Count * 0.65))
+                            : (streamWords.Count < 15 || aiWordCount >= streamWords.Count * 0.55 || !string.IsNullOrWhiteSpace(qualityIssue));
 
                         if (aiResult is { Success: true } && aiResult.TableRows.Count > 0 && aiHasEnoughWords)
                         {
@@ -246,6 +251,110 @@ public class PdfExtractionService : IPdfExtractionService
                 "Error",
                 $"PDF extraction error: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Removes any vector letters crossed out by a horizontal strikethrough line in page.Paths
+    /// (for example deleted rows or crossed-out numbers like DN 15-~~350~~-200 -> DN 15-200).
+    /// </summary>
+    private static IReadOnlyList<Letter> FilterOutStrikethroughLetters(Page page, IReadOnlyList<Letter> letters)
+    {
+        if (letters.Count == 0 || page.Paths == null || page.Paths.Count == 0)
+        {
+            return letters;
+        }
+
+        var strikeSegments = new List<(double Left, double Right, double CenterY)>();
+
+        void CollectIfHorizontalStrike(PdfRectangle r)
+        {
+            if (r.Height <= 2.6 && r.Width >= 2.0)
+            {
+                strikeSegments.Add((r.Left, r.Right, (r.Bottom + r.Top) / 2.0));
+            }
+        }
+
+        foreach (var path in page.Paths)
+        {
+            var pathRect = path.GetBoundingRectangle();
+            if (pathRect != null)
+            {
+                CollectIfHorizontalStrike(pathRect.Value);
+            }
+
+            foreach (var subpath in path)
+            {
+                var subRect = subpath.GetBoundingRectangle();
+                if (subRect != null)
+                {
+                    CollectIfHorizontalStrike(subRect.Value);
+                }
+            }
+        }
+
+        if (strikeSegments.Count == 0)
+        {
+            return letters;
+        }
+
+        var struck = new bool[letters.Count];
+        for (int i = 0; i < letters.Count; i++)
+        {
+            var letter = letters[i];
+            if (string.IsNullOrWhiteSpace(letter.Value)) continue;
+
+            var box = letter.BoundingBox;
+            double h = box.Height;
+            if (h < 3.2) continue;
+
+            double cx = (box.Left + box.Right) / 2.0;
+            double minY = box.Bottom + h * 0.25;
+            double maxY = box.Top - h * 0.20;
+
+            foreach (var seg in strikeSegments)
+            {
+                if (cx >= seg.Left - 0.4 && cx <= seg.Right + 0.4 &&
+                    seg.CenterY >= minY && seg.CenterY <= maxY)
+                {
+                    struck[i] = true;
+                    break;
+                }
+            }
+        }
+
+        // Also remove tiny punctuation (like '-') that sits directly on a strike line next to a struck letter
+        for (int i = 0; i < letters.Count; i++)
+        {
+            if (struck[i]) continue;
+            var letter = letters[i];
+            if (string.IsNullOrWhiteSpace(letter.Value) || letter.BoundingBox.Height >= 3.2) continue;
+
+            var box = letter.BoundingBox;
+            double cx = (box.Left + box.Right) / 2.0;
+            double cy = (box.Bottom + box.Top) / 2.0;
+            bool neighborStruck = (i > 0 && struck[i - 1]) || (i + 1 < letters.Count && struck[i + 1]);
+            if (!neighborStruck) continue;
+
+            foreach (var seg in strikeSegments)
+            {
+                if (cx >= seg.Left - 1.0 && cx <= seg.Right + 1.0 &&
+                    Math.Abs(seg.CenterY - cy) <= 1.6)
+                {
+                    struck[i] = true;
+                    break;
+                }
+            }
+        }
+
+        var result = new List<Letter>(letters.Count);
+        for (int i = 0; i < letters.Count; i++)
+        {
+            if (!struck[i])
+            {
+                result.Add(letters[i]);
+            }
+        }
+        return result;
     }
 
     private static List<WordBox> BuildStreamOrderedWords(IReadOnlyList<Letter> letters)
@@ -618,7 +727,7 @@ public class PdfExtractionService : IPdfExtractionService
         {
             int gridWords = CountWords(gridText);
             double coverage = gridWords / (double)streamWordCount;
-            if (coverage < 0.80)
+            if (coverage < 0.94)
             {
                 var (colText, colRows) = ExtractColumnAlignedGrid(streamWords);
                 if (CountWords(colText) > gridWords)
@@ -636,10 +745,10 @@ public class PdfExtractionService : IPdfExtractionService
         {
             int zoneWords = CountWords(zoneText);
             double coverage = zoneWords / (double)streamWordCount;
-            if (coverage < 0.85)
+            if (coverage < 0.94)
             {
                 var (colText, colRows) = ExtractColumnAlignedGrid(streamWords);
-                if (CountWords(colText) > zoneWords * 1.1)
+                if (CountWords(colText) > zoneWords)
                 {
                     notes.Add($"Cross-check: Multi-Zone covered {coverage:P0}; fell back to Column-Grid.");
                     return (colText, colRows, pageRotation != 0 ? $"Vector (Rotated {pageRotation:0}°)" : "Vector (Column-Grid Fallback)");
@@ -904,6 +1013,18 @@ public class PdfExtractionService : IPdfExtractionService
             allRows.AddRange(MapBandWordsToTableColumns(belowWords, colLines));
         }
 
+        var sideWords = words.Where(w =>
+        {
+            double cy = (w.Bottom + w.Top) / 2.0;
+            double cx = (w.Left + w.Right) / 2.0;
+            return cy <= tableTop + 2.0 && cy >= tableBottom - 2.0 &&
+                   (cx < tableLeft - 4.0 || cx > tableRight + 4.0);
+        }).ToList();
+        if (sideWords.Count > 0)
+        {
+            allRows.AddRange(MapBandWordsToTableColumns(sideWords, colLines));
+        }
+
         if (allRows.Count == 0)
         {
             return false;
@@ -1092,6 +1213,27 @@ public class PdfExtractionService : IPdfExtractionService
         }
 
         double bestGutterX = forcedSplitX ?? -1;
+        bool hasTallVerticalDivider = false;
+
+        if (bestGutterX < 0 && page.Paths != null)
+        {
+            foreach (var path in page.Paths)
+            {
+                var r = path.GetBoundingRectangle();
+                if (r != null && r.Value.Width <= 3.0 && r.Value.Height >= pageHeight * 0.45)
+                {
+                    double vx = (r.Value.Left + r.Value.Right) / 2.0;
+                    if (vx >= pageWidth * 0.40 && vx <= pageWidth * 0.60 &&
+                        bodyWords.Count(w => w.Left < vx && w.Right > vx) <= 2)
+                    {
+                        bestGutterX = vx;
+                        hasTallVerticalDivider = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         if (bestGutterX < 0)
         {
             var heights = bodyWords.Select(w => w.Height).Where(h => h > 0).OrderBy(h => h).ToList();
@@ -1122,8 +1264,8 @@ public class PdfExtractionService : IPdfExtractionService
             return false;
         }
 
-        // Only avoid splitting if a horizontal table border line crosses the gutter (single wide table)
-        if (page.Paths != null)
+        // Only avoid splitting if a horizontal table border line crosses the gutter WITHOUT a tall vertical panel divider
+        if (!hasTallVerticalDivider && page.Paths != null)
         {
             foreach (var path in page.Paths)
             {
@@ -1137,8 +1279,8 @@ public class PdfExtractionService : IPdfExtractionService
             }
         }
 
-        var leftWords = bodyWords.Where(w => w.Right <= bestGutterX).ToList();
-        var rightWords = bodyWords.Where(w => w.Left >= bestGutterX).ToList();
+        var leftWords = bodyWords.Where(w => (w.Left + w.Right) / 2.0 <= bestGutterX).ToList();
+        var rightWords = bodyWords.Where(w => (w.Left + w.Right) / 2.0 > bestGutterX).ToList();
 
         if (leftWords.Count < 5 || rightWords.Count < 5)
         {

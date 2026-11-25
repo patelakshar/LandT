@@ -280,4 +280,83 @@ public class PdfExtractionTests : IDisposable
         Assert.Contains("Left Zone", result.RawExtractedText);
         Assert.Contains("Right Zone", result.RawExtractedText);
     }
+
+    [Fact]
+    public async Task HyosungDatasheet_ExtractsAllRowsAndBothPages()
+    {
+        var pdfPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "hyosung offer_51_1.pdf"));
+        if (!File.Exists(pdfPath)) return;
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+
+        Assert.Equal(2, result.PageCount);
+        Assert.True(result.Pages[0].TableRows.Count >= 60, $"Expected >=60 rows on p1, got {result.Pages[0].TableRows.Count} ({result.Pages[0].ExtractionType})");
+        Assert.Contains("3443", result.Pages[0].Content);
+        Assert.Contains("3620", result.Pages[0].Content);
+        Assert.True(result.Pages[1].TableRows.Count >= 50, $"Expected >=50 rows on p2, got {result.Pages[1].TableRows.Count} ({result.Pages[1].ExtractionType})");
+        Assert.Contains("VG", result.Pages[1].Content);
+    }
+
+    [Fact]
+    public async Task StrikethroughText_IsExcludedFromExtractedOutput()
+    {
+        var pdfPath = Path.Combine(_tempDir, "strikethrough.pdf");
+        var builder = new PdfDocumentBuilder();
+        var font = builder.AddStandard14Font(Standard14Font.Helvetica);
+        var page = builder.AddPage(PageSize.A4);
+
+        // Normal row
+        page.AddText("BLFL", 10, new PdfPoint(40, 740), font);
+        page.AddText("Blind flange", 10, new PdfPoint(120, 740), font);
+        page.AddText("DN 15-600", 10, new PdfPoint(260, 740), font);
+        page.AddText("ASTM A182-F316", 10, new PdfPoint(360, 740), font);
+
+        // Struck-through row (horizontal line through middle of 10pt text at Y ~ 723.5)
+        page.AddText("LJFL", 10, new PdfPoint(40, 720), font);
+        page.AddText("Lap joint flange", 10, new PdfPoint(120, 720), font);
+        page.AddText("ASTM A105N", 10, new PdfPoint(360, 720), font);
+        page.DrawLine(new PdfPoint(38, 723.5), new PdfPoint(440, 723.5), 1.0);
+
+        // Partial strikethrough on "350" inside "DN 15-350-200"
+        page.AddText("SBNF", 10, new PdfPoint(40, 700), font);
+        page.AddText("Spectacle blind", 10, new PdfPoint(120, 700), font);
+        page.AddText("DN 15-350 200", 10, new PdfPoint(260, 700), font);
+        page.DrawLine(new PdfPoint(290, 703.5), new PdfPoint(312, 703.5), 1.0);
+
+        File.WriteAllBytes(pdfPath, builder.Build());
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+
+        Assert.Contains("BLFL", result.RawExtractedText);
+        Assert.DoesNotContain("LJFL", result.RawExtractedText);
+        Assert.DoesNotContain("ASTM A105N", result.RawExtractedText);
+        Assert.Contains("SBNF", result.RawExtractedText);
+        Assert.DoesNotContain("350", result.RawExtractedText);
+        Assert.Contains("200", result.RawExtractedText);
+    }
+
+    [Fact]
+    public async Task Pms15_ExcludesSingleCharacterAndRowStrikethroughs()
+    {
+        var pdfPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "kaa-main", "15_PDFsam_Extracted PMS 2_1.pdf"));
+        if (!File.Exists(pdfPath)) return;
+
+        var ocr = new StubOcrService(_ => new OcrResult(false, string.Empty));
+        var service = new PdfExtractionService(ocr, BuildConfig(), NullLogger<PdfExtractionService>.Instance);
+
+        var result = await service.ExtractAsync(pdfPath);
+
+        Assert.DoesNotContain("ASTM A105N", result.RawExtractedText);
+        Assert.DoesNotContain("TP316L", result.RawExtractedText);
+        Assert.Contains("TP316", result.RawExtractedText);
+        Assert.DoesNotContain("WP316L", result.RawExtractedText);
+        Assert.Contains("WP316", result.RawExtractedText);
+        Assert.Contains("33421N", result.RawExtractedText);
+    }
 }
